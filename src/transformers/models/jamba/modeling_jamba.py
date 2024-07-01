@@ -17,7 +17,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch Jamba model."""
+"""PyTorch Jamba model."""
+
 import inspect
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -29,7 +30,7 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN
-from ...cache_utils import DynamicCache  # we need __iter__ and __len__ of pkv
+from ...cache_utils import Cache, DynamicCache  # we need __iter__ and __len__ of pkv
 from ...modeling_attn_mask_utils import (
     AttentionMaskConverter,
 )
@@ -231,6 +232,7 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
         conv_kernel_size = config.mamba_d_conv
         self.conv_states = []
         self.ssm_states = []
+        self.transformer_layers = []
         for i in range(config.num_hidden_layers):
             if self.layers_block_type[i] == "mamba":
                 self.conv_states += [
@@ -242,6 +244,7 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
             else:
                 self.conv_states += [torch.tensor([[]] * batch_size, device=device)]
                 self.ssm_states += [torch.tensor([[]] * batch_size, device=device)]
+                self.transformer_layers.append(i)
 
         self.key_cache = [torch.tensor([[]] * batch_size, device=device) for _ in range(config.num_hidden_layers)]
         self.value_cache = [torch.tensor([[]] * batch_size, device=device) for _ in range(config.num_hidden_layers)]
@@ -275,6 +278,14 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
             self.conv_states[layer_idx] = self.conv_states[layer_idx].index_select(0, beam_idx.to(device))
             device = self.ssm_states[layer_idx].device
             self.ssm_states[layer_idx] = self.ssm_states[layer_idx].index_select(0, beam_idx.to(device))
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        # take any layer that contains cache and not empty tensor
+        layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
+        if len(self.key_cache) <= layer_idx:
+            return 0
+        return self.key_cache[layer_idx].shape[-2]
 
     def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
         raise NotImplementedError("HybridMambaAttentionDynamicCache does not have a legacy cache equivalent.")
@@ -714,14 +725,18 @@ class JambaSdpaAttention(JambaAttention):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+        is_causal = True if self.is_causal and causal_mask is None and q_len > 1 else False
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
             attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
-            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-            is_causal=self.is_causal and attention_mask is None and q_len > 1,
+            is_causal=is_causal,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -909,6 +924,8 @@ class JambaMambaMixer(nn.Module):
             else:
                 ssm_state = cache_params.ssm_states[self.layer_idx]
 
+            ssm_state = ssm_state.to(hidden_states.device)
+
             if cache_params.has_previous_state and seq_len == 1 and \
                     cache_params.conv_states[self.layer_idx].shape[0] == batch_size:
                 conv_state = cache_params.conv_states[self.layer_idx]                   # [batch, intermediate_size, conv_kernel_size]
@@ -950,16 +967,15 @@ class JambaMambaMixer(nn.Module):
         # 3.b. Discretization: B and C to [batch, seq_len, intermediate_size, ssm_state_size] (SRAM)
         A = -torch.exp(self.A_log.float())                                              # [intermediate_size, ssm_state_size]
         discrete_A = torch.exp(A[None, :, None, :] * discrete_time_step[:, :, :, None]) # [batch, intermediate_size, seq_len, ssm_state_size]
-        discrete_B = discrete_time_step[:, :, :, None] * B[:, None, :, :].float()       # [batch, intermediade_size, seq_len, ssm_state_size]
+        discrete_B = discrete_time_step[:, :, :, None] * B[:, None, :, :].float()       # [batch, intermediate_size, seq_len, ssm_state_size]
         deltaB_u = discrete_B * hidden_states[:, :, :, None].float()
-
         # 3.c perform the recurrence y ← SSM(A, B, C)(x)
         scan_outputs = []
         for i in range(seq_len):
-            ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]      # [batch, intermediade_size, ssm_state]
-            scan_output = torch.matmul(ssm_state.to(dtype), C[:, i, :].unsqueeze(-1))  # [batch, intermediade_size, 1]
+            ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]      # [batch, intermediate_size, ssm_state]
+            scan_output = torch.matmul(ssm_state.to(dtype), C[:, i, :].unsqueeze(-1))  # [batch, intermediate_size, 1]
             scan_outputs.append(scan_output[:, :, 0])
-        scan_output = torch.stack(scan_outputs, dim=-1)                                # [batch, intermediade_size, seq_len]
+        scan_output = torch.stack(scan_outputs, dim=-1)                                # [batch, intermediate_size, seq_len]
         scan_output = scan_output + (hidden_states * self.D[None, :, None])
         scan_output = (scan_output * self.act(gate))
 
@@ -967,7 +983,7 @@ class JambaMambaMixer(nn.Module):
             cache_params.ssm_states[self.layer_idx] = ssm_state
 
         # 4. Final linear projection
-        contextualized_states = self.out_proj(scan_output.transpose(1, 2))             # [batch, seq_len, hidden_size]
+        contextualized_states = self.out_proj(scan_output.transpose(1, 2))  # [batch, seq_len, hidden_size]
         return contextualized_states
     # fmt: on
 
@@ -985,7 +1001,6 @@ class JambaMambaMixer(nn.Module):
 class JambaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -993,8 +1008,8 @@ class JambaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, hidden_state):
+        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
 # Adapted from transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock with Mistral->Jamba
@@ -1250,7 +1265,8 @@ class JambaPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
-    _supports_cache_class = True
+    _supports_cache_class = True  # Note: only supports HybridMambaAttentionDynamicCache
+    _is_stateful = True
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -1796,7 +1812,7 @@ class JambaForSequenceClassification(JambaPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
